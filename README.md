@@ -190,7 +190,6 @@ The following data is not migrated and will be skipped:
 - Views
 - The order of project items displayed in your views
 - Workflows
-- Iteration custom fields
 
 You may want to add views and workflows to a template, manually create your project from a template, and then use the `import` command's `--project-number` option to import items and fields into that project.
 

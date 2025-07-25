@@ -262,7 +262,7 @@ const getIssueOrPullRequestByRepositoryAndNumber = async ({
 
     return response.repository.issueOrPullRequest;
   } catch (e) {
-    if (e.message.includes('Could not resolve to an issue or pull request')) {
+    if (e instanceof Error && e.message.includes('Could not resolve to an issue or pull request')) {
       return null;
     } else {
       throw e;
@@ -401,6 +401,7 @@ const updateProjectItemFieldValue = async ({
     number: number | undefined;
     singleSelectOptionId: string | undefined;
     text: string | undefined;
+    iterationId: string | undefined;
   };
 }): Promise<void> => {
   await octokit.graphql(
@@ -423,17 +424,23 @@ const createProjectField = async ({
   name,
   dataType,
   singleSelectOptions,
+  iterationConfiguration,
 }: {
   octokit: Octokit;
   projectId: string;
   name: string;
   dataType: string;
   singleSelectOptions?: SelectOption[];
+  iterationConfiguration?: {
+    iterations: Array<{
+      startDate: string;
+    }>;
+  };
 }): Promise<CreatedProjectField> => {
   const response = (await octokit.graphql(
     `
-    mutation createProjectField($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!, $singleSelectOptions: [ProjectV2SingleSelectFieldOptionInput!]) {
-      createProjectV2Field(input: { projectId: $projectId, name: $name, dataType: $dataType, singleSelectOptions: $singleSelectOptions }) {
+    mutation createProjectField($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!, $singleSelectOptions: [ProjectV2SingleSelectFieldOptionInput!], $iterationConfiguration: ProjectV2IterationFieldConfigurationInput) {
+      createProjectV2Field(input: { projectId: $projectId, name: $name, dataType: $dataType, singleSelectOptions: $singleSelectOptions, iterationConfiguration: $iterationConfiguration }) {
         projectV2Field {
           ... on ProjectV2Field {
             id
@@ -454,7 +461,7 @@ const createProjectField = async ({
         }
       }
     }`,
-    { projectId, name, dataType, singleSelectOptions },
+    { projectId, name, dataType, singleSelectOptions, iterationConfiguration },
   )) as { createProjectV2Field: { projectV2Field: CreatedProjectField } };
 
   return response.createProjectV2Field.projectV2Field;
@@ -548,7 +555,8 @@ const isCustomField = ({
   name: string;
 }): boolean => {
   return (
-    ['TEXT', 'SINGLE_SELECT', 'DATE', 'NUMBER'].includes(dataType) && name !== 'Status'
+    ['TEXT', 'SINGLE_SELECT', 'DATE', 'NUMBER', 'ITERATION'].includes(dataType) &&
+    name !== 'Status'
   );
 };
 
@@ -928,6 +936,7 @@ const importProjectItem = async (opts: {
         sourceProjectItemCustomField.optionId && optionMappings
           ? optionMappings.get(sourceProjectItemCustomField.optionId)
           : undefined,
+      iterationId: sourceProjectItemCustomField.iterationId,
     };
     await updateProjectItemFieldValue({
       octokit,
@@ -1268,7 +1277,7 @@ command
       logger.info(`Creating ${customFieldsToCreate.length} custom field(s)...`);
 
       for (const customFieldToCreate of customFieldsToCreate) {
-        const { id, dataType, name, options } = customFieldToCreate;
+        const { id, dataType, name, options, configuration } = customFieldToCreate;
 
         logger.info(`Creating '${name}' field...`);
 
@@ -1304,6 +1313,9 @@ command
           name,
           dataType,
           singleSelectOptions: fieldOptionsForCreation,
+          iterationConfiguration: dataType === 'ITERATION' && configuration?.iterations
+            ? { iterations: configuration.iterations.map(iter => ({ startDate: iter.startDate })) }
+            : undefined,
         });
 
         // If our newly created field has options, we need to correlate the old and new option IDs

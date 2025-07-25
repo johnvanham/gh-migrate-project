@@ -63,6 +63,12 @@ export interface Project {
         description?: string;
         color?: ProjectSingleSelectFieldOptionColor;
       }>;
+      configuration?: {
+        iterations?: Array<{
+          id: string;
+          startDate: string;
+        }>;
+      };
     }>;
     totalCount: number;
   };
