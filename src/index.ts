@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+// Restore user's current working directory if set by wrapper script
+if (process.env.USER_CWD) {
+  process.chdir(process.env.USER_CWD);
+}
+
 import * as commander from 'commander';
 
 import VERSION from './version.js';

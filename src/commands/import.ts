@@ -21,6 +21,7 @@ import { createOctokit } from '../octokit.js';
 import {
   DraftIssueProjectItem,
   ProjectSingleSelectFieldOptionColor,
+  ProjectItemFieldValueType,
   type Project,
   type ProjectItem,
 } from '../graphql-types.js';
@@ -262,7 +263,10 @@ const getIssueOrPullRequestByRepositoryAndNumber = async ({
 
     return response.repository.issueOrPullRequest;
   } catch (e) {
-    if (e instanceof Error && e.message.includes('Could not resolve to an issue or pull request')) {
+    if (
+      e instanceof Error &&
+      e.message.includes('Could not resolve to an issue or pull request')
+    ) {
       return null;
     } else {
       throw e;
@@ -383,6 +387,149 @@ const addItemToProject = async ({
   )) as { addProjectV2ItemById: { item: { id: string } } };
 
   return response.addProjectV2ItemById.item.id;
+};
+
+// Extract iteration metadata from project items for generic iteration field support
+const extractIterationMetadata = (projectItems: ProjectItem[]) => {
+  const iterationMap = new Map<
+    string,
+    { duration: number; title: string; startDate: string }
+  >();
+
+  for (const item of projectItems) {
+    for (const fieldValue of item.fieldValues.nodes) {
+      if (
+        fieldValue.__typename === ProjectItemFieldValueType.Iteration &&
+        fieldValue.iterationId &&
+        fieldValue.duration &&
+        fieldValue.title &&
+        fieldValue.startDate
+      ) {
+        const key = fieldValue.iterationId;
+        if (!iterationMap.has(key)) {
+          iterationMap.set(key, {
+            duration: fieldValue.duration,
+            title: fieldValue.title,
+            startDate: fieldValue.startDate,
+          });
+        }
+      }
+    }
+  }
+
+  return iterationMap;
+};
+
+// Create iteration configuration using actual data from export
+const createIterationConfiguration = (
+  fieldConfiguration: { iterations: Array<{ id: string; startDate: string }> },
+  projectItems: ProjectItem[],
+) => {
+  const iterationMetadata = extractIterationMetadata(projectItems);
+
+  // Create a Set to track start dates we've already included
+  const includedStartDates = new Set<string>();
+  const allIterations: Array<{ startDate: string; duration: number; title: string }> = [];
+
+  // First, add all iterations from actual field values (highest priority)
+  for (const [sourceId, metadata] of iterationMetadata) {
+    if (!includedStartDates.has(metadata.startDate)) {
+      allIterations.push({
+        startDate: metadata.startDate,
+        duration: metadata.duration,
+        title: metadata.title,
+      });
+      includedStartDates.add(metadata.startDate);
+    }
+  }
+
+  // Then, add any field configuration iterations that aren't already covered
+  for (const configIter of fieldConfiguration.iterations) {
+    if (!includedStartDates.has(configIter.startDate)) {
+      const metadata = iterationMetadata.get(configIter.id);
+      if (metadata) {
+        // Use metadata from field values if available
+        allIterations.push({
+          startDate: metadata.startDate,
+          duration: metadata.duration,
+          title: metadata.title,
+        });
+      } else {
+        // Fallback for iterations without metadata
+        allIterations.push({
+          startDate: configIter.startDate,
+          duration: 7, // Default to 7 days if no metadata available
+          title: `Iteration ${new Date(configIter.startDate).toISOString().split('T')[0]}`,
+        });
+      }
+      includedStartDates.add(configIter.startDate);
+    }
+  }
+
+  // Sort by startDate
+  allIterations.sort((a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime());
+
+  return {
+    iterations: allIterations,
+    startDate: allIterations[0]?.startDate,
+    duration: allIterations[0]?.duration || 7,
+  };
+};
+
+const getIterationFieldDetails = async ({
+  octokit,
+  projectId,
+  fieldName,
+}: {
+  octokit: Octokit;
+  projectId: string;
+  fieldName: string;
+}): Promise<{ iterations: Array<{ id: string; startDate: string; title: string; duration: number }> }> => {
+  const response = (await octokit.graphql(
+    `query getIterationField($projectId: ID!, $fieldName: String!) {
+      node(id: $projectId) {
+        ... on ProjectV2 {
+          field(name: $fieldName) {
+            ... on ProjectV2IterationField {
+              configuration {
+                iterations {
+                  id
+                  startDate
+                  title
+                  duration
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { projectId, fieldName },
+  )) as { node: { field: { configuration: { iterations: Array<{ id: string; startDate: string; title: string; duration: number }> } } } };
+
+  return response.node.field.configuration;
+};
+
+const createIterationMapping = (
+  sourceIterations: Map<string, { duration: number; title: string; startDate: string }>,
+  targetIterations: Array<{ id: string; startDate: string; title: string; duration: number }>,
+): Map<string, string> => {
+  const mapping = new Map<string, string>();
+
+  for (const [sourceId, sourceIteration] of sourceIterations) {
+    // Find matching target iteration by startDate and title
+    const targetIteration = targetIterations.find(
+      (target) => 
+        target.startDate === sourceIteration.startDate && 
+        target.title === sourceIteration.title
+    );
+    
+    if (targetIteration) {
+      mapping.set(sourceId, targetIteration.id);
+    }
+  }
+
+  return mapping;
 };
 
 const updateProjectItemFieldValue = async ({
@@ -688,7 +835,6 @@ const isProjectItemCustomFieldValue = (field: {
       'ProjectV2ItemFieldUserValue',
       'ProjectV2ItemFieldPullRequestValue',
       'ProjectV2ItemFieldReviewerValue',
-      'ProjectV2ItemFieldIterationValue',
       'ProjectV2ItemFieldMilestoneValue',
       'ProjectV2ItemFieldReviewerValue',
     ].includes(field.__typename)
@@ -854,6 +1000,7 @@ const importProjectItem = async (opts: {
   sourceToTargetCustomFieldMappings: Map<string, CustomField>;
   targetProjectId: string;
   assigneeGlobalIdMappings: Map<string, string>;
+  iterationFieldMappings: Map<string, Map<string, string>>;
 }): Promise<void> => {
   const {
     assigneeGlobalIdMappings,
@@ -865,6 +1012,7 @@ const importProjectItem = async (opts: {
     sourceProjectItem,
     sourceToTargetCustomFieldMappings,
     targetProjectId,
+    iterationFieldMappings,
   } = opts;
 
   logger.info(
@@ -928,16 +1076,44 @@ const importProjectItem = async (opts: {
     }
 
     const { targetId: targetFieldId, optionMappings } = fieldMapping;
-    const value = {
-      date: sourceProjectItemCustomField.date,
-      number: sourceProjectItemCustomField.number,
-      text: sourceProjectItemCustomField.text,
-      singleSelectOptionId:
-        sourceProjectItemCustomField.optionId && optionMappings
-          ? optionMappings.get(sourceProjectItemCustomField.optionId)
-          : undefined,
-      iterationId: sourceProjectItemCustomField.iterationId,
-    };
+    
+    // Map source iteration ID to target iteration ID if this is an iteration field
+    const sourceFieldId = sourceProjectItemCustomField.field.id;
+    const iterationMapping = iterationFieldMappings.get(sourceFieldId);
+    const mappedIterationId = sourceProjectItemCustomField.iterationId && iterationMapping
+      ? iterationMapping.get(sourceProjectItemCustomField.iterationId)
+      : sourceProjectItemCustomField.iterationId;
+    
+    // Check if this is an iteration field that couldn't be mapped (likely past date)
+    if (sourceProjectItemCustomField.iterationId && !mappedIterationId && iterationMapping) {
+      logger.warn(
+        `Skipping iteration field "${sourceProjectItemCustomField.field.name}" for project item ${createdProjectItemId}: source iteration "${sourceProjectItemCustomField.title || sourceProjectItemCustomField.iterationId}" (${sourceProjectItemCustomField.startDate}) could not be mapped to target project (likely a past date that GitHub API rejected)`
+      );
+      continue; // Skip this field entirely
+    }
+    
+    // Build field value object with only the relevant field type
+    let value: any = {};
+    
+    if (mappedIterationId) {
+      value.iterationId = mappedIterationId;
+    } else if (sourceProjectItemCustomField.date) {
+      value.date = sourceProjectItemCustomField.date;
+    } else if (sourceProjectItemCustomField.number !== undefined) {
+      value.number = sourceProjectItemCustomField.number;
+    } else if (sourceProjectItemCustomField.text) {
+      value.text = sourceProjectItemCustomField.text;
+    } else if (sourceProjectItemCustomField.optionId && optionMappings) {
+      value.singleSelectOptionId = optionMappings.get(sourceProjectItemCustomField.optionId);
+    }
+    
+    // Ensure we have a valid field value to set
+    if (Object.keys(value).length === 0) {
+      logger.warn(
+        `Skipping field "${sourceProjectItemCustomField.field.name}" for project item ${createdProjectItemId}: no valid field value could be constructed`
+      );
+      continue;
+    }
     await updateProjectItemFieldValue({
       octokit,
       projectId: targetProjectId,
@@ -1313,9 +1489,10 @@ command
           name,
           dataType,
           singleSelectOptions: fieldOptionsForCreation,
-          iterationConfiguration: dataType === 'ITERATION' && configuration?.iterations
-            ? { iterations: configuration.iterations.map(iter => ({ startDate: iter.startDate })) }
-            : undefined,
+          iterationConfiguration:
+            dataType === 'ITERATION' && configuration?.iterations
+              ? createIterationConfiguration(configuration, sourceProjectItems)
+              : undefined,
         });
 
         // If our newly created field has options, we need to correlate the old and new option IDs
@@ -1331,6 +1508,25 @@ command
       }
 
       logger.info(`Created ${customFieldsToCreate.length} custom field(s)`);
+
+      // Create iteration ID mappings for iteration fields
+      const iterationFieldMappings = new Map<string, Map<string, string>>();
+      for (const customFieldToCreate of customFieldsToCreate) {
+        if (customFieldToCreate.dataType === 'ITERATION' && customFieldToCreate.configuration?.iterations) {
+          const fieldMapping = sourceToTargetCustomFieldMappings.get(customFieldToCreate.id);
+          if (fieldMapping) {
+            const targetIterationField = await getIterationFieldDetails({
+              octokit,
+              projectId: targetProjectId,
+              fieldName: customFieldToCreate.name,
+            });
+            
+            const sourceIterations = extractIterationMetadata(sourceProjectItems);
+            const iterationMapping = createIterationMapping(sourceIterations, targetIterationField.iterations);
+            iterationFieldMappings.set(customFieldToCreate.id, iterationMapping);
+          }
+        }
+      }
 
       // The GraphQL mutation 'updateProjectV2Field' is available on GitHub.com,
       // GitHub Enterprise Cloud with Data Residency, and GitHub Enterprise Server 3.17+
@@ -1399,6 +1595,7 @@ command
           sourceToTargetCustomFieldMappings,
           targetProjectId,
           assigneeGlobalIdMappings,
+          iterationFieldMappings,
         });
       }
 
