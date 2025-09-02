@@ -12,6 +12,7 @@ export enum ProjectSortByFieldDirection {
 export enum ProjectFieldLayout {
   TABLE = 'TABLE_LAYOUT',
   BOARD = 'BOARD_LAYOUT',
+  ROADMAP = 'ROADMAP_LAYOUT',
 }
 
 export enum ProjectItemType {
